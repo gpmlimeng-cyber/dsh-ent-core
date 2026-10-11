@@ -16,6 +16,8 @@ import { decrypt, deriveKey } from '../crypto.js'
 import { hashUid } from '../isolation.js'
 import { LocalSpawner } from '../supervisor/orchestrator.js'
 import { K8sSpawner } from '../supervisor/k8s-spawner.js'
+import { CubesandboxSpawner } from '../supervisor/cubesandbox-spawner.js'
+import { createSandboxClient } from '../sandbox/provider.js'
 import { registerDshProxy } from '../supervisor/proxy.js'
 import type { Spawner } from '../supervisor/spawner.js'
 import { rateLimit } from './middleware/rate-limit.js'
@@ -61,10 +63,15 @@ export async function buildServer(config: ServerConfig): Promise<FastifyInstance
     const user = await db.findUserById(userId)
     return user?.uid ?? hashUid(userId, config.baseUid)
   }
+  // One spawner per deploy mode. The cubesandbox branch resolves its client here
+  // on purpose: `createSandboxClient` throws until P3, so configuring a backend
+  // that cannot run fails at startup rather than at the first launch.
   const supervisor: Spawner =
     config.deployMode === 'k8s'
       ? new K8sSpawner(config, db, resolveApiKey, resolveUid)
-      : new LocalSpawner(config, resolveApiKey, resolveUid)
+      : config.deployMode === 'cubesandbox'
+        ? new CubesandboxSpawner(config, db, resolveApiKey, createSandboxClient(config))
+        : new LocalSpawner(config, resolveApiKey, resolveUid)
   const userFs = createUserFs(config, (userId) => supervisor.ensureFileService(userId))
 
   const app = Fastify({

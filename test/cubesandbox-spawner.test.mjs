@@ -165,19 +165,25 @@ test("cube: stop PAUSES — the sandbox and the desired row both survive", async
   assert.deepEqual(client.paused, ['dsh-u1'])
 })
 
-test('cube: status maps sandbox states (paused → stopped until the P2 migration)', async () => {
+test('cube: status maps sandbox states, and paused stays paused', async () => {
   const { client, spawner } = build()
   assert.deepEqual(await spawner.status('u1'), {}, 'absent → empty status')
 
   await spawner.launch('u1', '/ws')
   assert.equal((await spawner.status('u1')).main.status, 'running')
   client.setState('dsh-u1', 'paused')
-  // Deliberate P1 mapping: `paused` is in neither `InstanceStatus` nor the two
-  // `dsh_instances.status` CHECKs. P2 adds it to all four mirrors (§7) and
-  // flips this assertion to 'paused'.
-  assert.equal((await spawner.status('u1')).main.status, 'stopped')
+  // P2 flipped this: `paused` is now in `InstanceStatus`, its `db/types.ts`
+  // mirror and both CHECK constraints (migration v5, §7) — and the value has to
+  // survive the round trip because it is what stops the reconcile idle-reap from
+  // rewriting the row on every tick.
+  assert.equal((await spawner.status('u1')).main.status, 'paused')
   client.setState('dsh-u1', 'error')
   assert.equal((await spawner.status('u1')).main.status, 'crashed')
+})
+
+test('cube: idlePolicy is retain — the backend, not the controller, decides', async () => {
+  const { spawner } = build()
+  assert.equal(spawner.idlePolicy, 'retain')
 })
 
 test('cube: restartMain restarts dsh inside the same sandbox (no destroy)', async () => {
@@ -248,21 +254,91 @@ test('cube: teardown destroys every owned sandbox and keeps the volumes', async 
   assert.equal(client.sandboxes.size, 0)
 })
 
-test('cube: listLiveInstances feeds planReconcile', async () => {
+test('cube: listUserPods feeds planReconcile, and a paused row is not "missing"', async () => {
   const { client, rows, spawner } = build()
   await spawner.launch('u1', '/ws')
 
-  const live = await spawner.listLiveInstances()
+  const live = await spawner.listUserPods()
   assert.deepEqual(
     live.map((entry) => [entry.name, entry.userId, entry.running, entry.crashed]),
     [['dsh-u1', 'u1', true, false]],
   )
-  assert.deepEqual(planReconcile([rows.get('dsh-u1')], live), { launch: [], delete: [] }, 'a running sandbox is not relaunched')
+  assert.deepEqual(
+    planReconcile([rows.get('dsh-u1')], live),
+    { launch: [], delete: [], markRunning: [] },
+    'a running sandbox is not relaunched',
+  )
 
-  // P2 decides the `paused` verdict (a paused row must stop counting as
-  // "missing"); P1 only pins the shape it maps.
+  // The P2 verdict: a paused live sandbox with a paused desired row is the
+  // intended steady state — relaunching it every tick would defeat the snapshot.
   client.setState('dsh-u1', 'paused')
-  assert.deepEqual((await spawner.listLiveInstances()).map((entry) => entry.running), [false])
+  assert.deepEqual((await spawner.listUserPods()).map((entry) => entry.running), [false])
+  const pausedRow = { ...rows.get('dsh-u1'), status: 'paused' }
+  assert.deepEqual(
+    planReconcile([pausedRow], await spawner.listUserPods()),
+    { launch: [], delete: [], markRunning: [] },
+    'paused ≠ missing',
+  )
+  // A paused sandbox that is *running* again was resumed out of band.
+  client.setState('dsh-u1', 'running')
+  assert.deepEqual(
+    planReconcile([pausedRow], await spawner.listUserPods()).markRunning.map((row) => row.id),
+    ['dsh-u1'],
+    'an observed resume is recorded so the row stops being sticky',
+  )
+})
+
+test('cube: watchMainPods polls the live set and stops on request', async () => {
+  const { client, spawner } = build({ sandbox: { watchIntervalMs: 5 } })
+  await spawner.launch('u1', '/ws')
+
+  const seen = []
+  const watcher = spawner.watchMainPods((pod) => seen.push([pod.userId, pod.running]))
+  await watcher.start()
+  assert.deepEqual(seen, [['u1', true]], 'the first poll is synchronous with start()')
+
+  client.setState('dsh-u1', 'paused')
+  await new Promise((resolve) => setTimeout(resolve, 25)) // let one interval fire
+  assert.ok(seen.some(([, running]) => running === false), 'a later poll sees the pause')
+
+  await watcher.stop()
+  const afterStop = seen.length
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(seen.length, afterStop, 'no polls after stop()')
+})
+
+test('cube: a failed poll is logged, not thrown, and the watch keeps going', async () => {
+  const { client, spawner } = build({ sandbox: { watchIntervalMs: 5 } })
+  await spawner.launch('u1', '/ws')
+
+  const errors = []
+  spawner.logError = (err) => errors.push(err)
+  const seen = []
+  const watcher = spawner.watchMainPods((pod) => seen.push(pod.userId))
+  client.failNext('list', new Error('cube api down'))
+  await watcher.start()
+  assert.equal(seen.length, 0, 'a failed poll emits nothing')
+  assert.equal(errors.length, 1, 'and is reported through logError')
+
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.ok(seen.length > 0, 'the next poll recovers')
+
+  await watcher.stop()
+})
+
+test('cube: setFencing stamps the leader token onto new sandboxes', async () => {
+  const { client, spawner } = build()
+  spawner.setFencing({ holder: 'pod-1', operationId: 7 })
+  await spawner.launch('u1', '/ws')
+  assert.equal(client.sandboxes.get('dsh-u1').labels['dsh.io/holder'], 'pod-1')
+  assert.equal(client.sandboxes.get('dsh-u1').labels['dsh.io/operation-id'], '7')
+})
+
+test('cube: ensureUserResources (and ensureFileService) ensure the volume', async () => {
+  const { client, spawner } = build()
+  await spawner.ensureUserResources('u9')
+  await spawner.ensureFileService('u9')
+  assert.ok(client.volumes.has('dsh-vol-u9'), 'the volume the sandbox mounts')
 })
 
 test('cube: launch replaces a sandbox stuck in the error state', async () => {

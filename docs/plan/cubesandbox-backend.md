@@ -113,12 +113,14 @@ constructor(config, db, resolveApiKey, resolveUid, client?: SandboxClient)
 
 `deployMode` 现状是 `'local' | 'k8s'`（`src/config.ts:61,198-199`）。加 `'cubesandbox'` 后，所有 `=== 'k8s'` / `=== 'local'` 的地方都会**静默走到 else 分支**：
 
-| 位置 | 现状含义 | 加第三值后的行为 | 要做的事 |
-|---|---|---|---|
-| `src/web/server.ts:64-68` | 选后端 | 掉进 `LocalSpawner` | 加第三分支（显式） |
-| `src/cli.ts:144-147` | `k8s` 才建 `ReconcileController` | **不再建收敛器** → 没有 AutoPause/回收 | **必须把 cubesandbox 也纳入** |
-| `src/supervisor/proxy.ts:206,217` | 传 `deployMode === 'local'` 给 `proxyHttp` | 变 `false`（表现同 k8s） | **复核该布尔的真实含义**，必要时改成显式枚举 |
-| `src/fs/provider.ts:33` | 选 `UserFs` 实现 | 掉进 local 分支（控制面直摸卷）| 新增 cubesandbox 分支（§10） |
+| 位置 | 现状含义 | 加第三值后的行为（改前预判） | 要做的事 | **P2 实做** |
+|---|---|---|---|---|
+| `src/web/server.ts:64-68` | 选后端 | 掉进 `LocalSpawner` | 加第三分支（显式） | ✅ 加了第三分支；客户端从 `createSandboxClient()` 取（P3 前抛异常，见下） |
+| `src/cli.ts:144-147` | `k8s` 才建 `ReconcileController` | **不再建收敛器** → 没有 AutoPause/回收 | **必须把 cubesandbox 也纳入** | ✅ 纳入；并把原来的裸转换 `as K8sSpawner` 换成运行时能力检查 `isSupervisedSpawner()` |
+| `src/supervisor/proxy.ts:206,217` | 传 `deployMode === 'local'` 给 `proxyHttp` | 变 `false`（表现同 k8s） | **复核该布尔的真实含义**，必要时改成显式枚举 | ✅ **复核后确认不动**：该布尔的语义是"endpoint 是回环地址"（决定要不要把 `127.0.0.1` 的 Location 改写成真实 origin）。沙箱 endpoint 是**沙箱节点**的 `host:port`，永远不是回环 ⇒ 与 k8s 同值 `false` 恰好正确。改它是为零收益而动线上代理路径 |
+| `src/fs/provider.ts:33` | 选 `UserFs` 实现 | 掉进 local 分支（控制面直摸卷）| 新增 cubesandbox 分支（§10） | ⚠️ **改为响亮失败**：控制面不持有用户卷，掉进 `LocalUserFs` 会**静默服务错的那块盘**（控制面本地空目录）⇒ 抛错而不是猜。真实现属 P3/§10 |
+
+> **两处"配了就崩"是刻意的**：`createSandboxClient()`（`src/sandbox/provider.ts`）与 `createUserFs()` 的 cubesandbox 分支都是 P3 的接缝，在 P3 之前**故意抛异常并说明是哪个阶段**。理由与 P1 把 client 设成必填构造参数一致：宁可启动即失败，也不要让"编译得过、部署必错"成为可能。`local`/`k8s` 两条路径行为零变化（有回归锁）。
 
 > 另外：**DB 后端不是由 `deployMode` 选的**，而是由 `DSH_SERVER_LOGIN_DB_URL` 是否存在决定（`src/db/adapter.ts:4`、`src/db/sqlite.ts:4`）。决策点：单控制面 + 沙箱 → SQLite 够用；多副本控制面 → 必须 PG（`pg.ts` 还兼作 leader 选举/单飞）。
 
@@ -147,6 +149,8 @@ constructor(config, db, resolveApiKey, resolveUid, client?: SandboxClient)
 ---
 
 ## 7. 数据库迁移 v5（两条引擎都改，别只改一条）
+
+> **✅ P2 已落地。** 实做与本文的一处偏离：**只加 `paused`，没有加 `sandbox_id` / `node` / `paused_at` 三列**。理由是本文"建议加新列"的隐含前提（"反正要重建表，一次做完"）不成立 —— SQLite 只有**改 CHECK** 必须重建，**加列是普通 `ALTER TABLE ADD COLUMN`**（v2/v3/v4 都是这么加的），所以现在加将来加一样便宜，而少三列就少三处类型/映射/两条 SQL 的改动面。`sandbox_id`/`node` 的真实形态要等 P4（per-task）决定沙箱命名是否还保持确定性推导（现为 `dsh-<userId>`）。（`paused_at` 若要做可观测性，另开一刀。）
 
 `status` 的 CHECK 在**两处**重复（`schema.ts:67` SQLite、`:153` PG），加 `paused` 必须都改；新列建议 `sandbox_id` / `node` / `paused_at`。
 
@@ -187,6 +191,13 @@ ALTER TABLE dsh_instances ADD COLUMN paused_at BIGINT;
 ---
 
 ## 8. `reconcile` 现在是**硬绑 k8s** 的（上游的第二个欠缺）
+
+> **✅ P2 已落地，按本文建议的第 2 种（抽出 `SupervisedSpawner`）。** 实做补充三点：
+> 1. `SupervisedSpawner` 多了一个成员 `idlePolicy`（§9 的开关）——由**后端**回答"空闲该不该保留期望行"，控制器只读它，不认 `deployMode`。
+> 2. `watchMainPods` 的返回类型不是 k8s 的 `Informer`，而是一个结构性最小的 `LiveWatcher { start(); stop() }` ——否则共享模块还得 import 集群客户端，等于把同一个类型泄漏换个地方。k8s 的 `Informer` 天然满足它。
+> 3. `ReconcileController` 里那句**裸转换** `app.supervisor as K8sSpawner`（`cli.ts`）换成了运行时能力检查 `isSupervisedSpawner()`：`buildServer` 交回的是 `Spawner`，将来若新增一个 deploy mode 忘了提供受监督实现，必须在**启动时**报错，而不是在第一次 tick 里以 TypeError 现形。
+>
+> 沙箱侧的 `watchMainPods` 用**轮询适配器**（`watchIntervalMs` 已是配置字段，默认 10s）。它每次轮询都对所有受管沙箱发一次事件，比 informer 冗余 —— 这是**安全的**，因为崩溃路径本身有 `watchdogFired` 去重（重复事件不会拉起第二个 watchdog，健康事件是空操作），而且轮询失败只记日志、下一轮继续（对不上时 tick 仍会收敛）。
 
 `ReconcileController` 的构造函数（`reconcile.ts:50-56`）**收的是具体类 `K8sSpawner`**，不是 `Spawner` 接口，并且 tick 里直接用了 5 个 k8s 专属成员：
 
@@ -246,6 +257,12 @@ await this.db.markPaused(instance.id)      // ★ 期望行【保留】，只改
 2. `endpointFor` 在 `paused` 状态下返回的地址，**语义变成"唤醒后可用的地址"**（proxy 的请求会阻塞到 AutoResume 完成 —— 需要确认 `proxy.ts` 的 `proxy_read_timeout` 与上游超时是否够长）；
 3. **首次访问的唤醒延迟必须实测**（这是用户可感知的：点开页面等几秒）。若实测过长，需要在 UI 上给"正在唤醒"状态。
 
+> **✅ P2 已落地。** 实做取的是"后端自答"而不是"看 `deployMode`"：新增 `IdlePolicy = 'release' | 'retain'`，`K8sSpawner` 报 `release`，`CubesandboxSpawner` 报 `retain`，控制器据此决定 `deleteInstance` 还是 `setInstanceStatus(id,'paused')`。三种路径都有回归锁（`test/reconcile.test.mjs`，含"k8s 行为不变"那一条）。
+>
+> 本文原案里的 `spawner.resume?.(userId)` **没有采纳**：沙箱平台的 AutoResume 是数据面触发的（用户下一个请求本身就会唤醒它），控制面再发一次 resume 是多余的网络往返，且会把唤醒延迟叠加一倍。控制面改为**只观察**：`planReconcile` 新增 `markRunning` —— 一个 `paused` 行若被观察到**已在 running**，说明它被（平台的）AutoResume 唤醒了，就把行记回 `running`。没有这一步 `paused` 会变成**粘性状态**：唤醒后再也不会被回收。观察发生在回收之后，所以"本轮记回 running、下一轮用户已离线时再挂起"是收敛的。
+>
+> 两个实现细节值得记：① 回收循环对**已经是 `paused` 的行直接跳过**，否则每个 tick 都会重复写一次同一状态（有测试锁"写次数恰为 1"）；② 行状态**不在请求路径上** —— proxy 只调 `endpointFor()`，从不读 `dsh_instances`，所以即使行状态短暂滞后也不会挡用户。
+
 ---
 
 ## 10. 存储与文件面
@@ -258,6 +275,8 @@ await this.db.markPaused(instance.id)      // ★ 期望行【保留】，只改
 | **不要用 raw host mount** | 上游卷框架明确：**raw host mount 会把快照钉在原节点**（跨节点恢复失败、快照不含它）；plugin Volume 不钉 | — |
 
 `ensureFileService` 这个方法在上游是为 k8s sidecar 留的（`spawner.ts:77-79` 注释），**在 Cube 后端正好第二次用上** —— 又一个"上游设计已经预见到"的证据。
+
+> **⚠️ P2 状态：文件面还没落地，而且被改成响亮失败。** P2 给 `ensureFileService`/`ensureUserResources`（= 确保卷存在）写了实现，但 **`UserFs` 本身还没有**：`createUserFs()` 遇到 `cubesandbox` **抛错**，而不是掉进 `LocalUserFs`。原因是这条 fallback 是**静默错误**：控制面不持有用户卷（与 k8s 同理），`LocalUserFs` 会去读 `dataRoot/users/<id>` —— 那里是空的，用户会看到"文件全没了"，而不是一个错误。真正的 `SandboxUserFs`（照 `k8s-user-fs.ts` 的范式，走 client 的文件 API）属 P3，与真实客户端同一刀，因为**它也需要那个客户端**。
 
 ---
 
@@ -297,8 +316,16 @@ CubeEgress 的做法是**L7 代理按域注入凭据，密钥对沙箱代码不�
 
 1. `test/cubesandbox-spawner.test.mjs`：假 `SandboxClient`，覆盖 `AlreadyRunningError`、pause 幂等、`endpointFor` 映射、`ensureFileService` 幂等、`teardown` 全清；
 2. `test/task-sandbox.test.mjs`：create→exec→destroy、超时回收、owner 可空；
-3. `test/reconcile.test.mjs`：`planReconcile` 对 **`paused` 行不得判为缺失**（这是 §9 的回退锁）；`stop` 后**期望行必须还在**；
-4. `test/db.test.mjs` 扩：迁移 v5 在 **SQLite 与 PG 两侧**都能把旧库升上来（含 `paused` 可写）。
+3. `test/reconcile.test.mjs`：`planReconcile` 对 **`paused` 行不得判为缺失**（这是 §9 的回退锁）；`stop` 后**期望行必须还在**； 　**✅ P2 已写（12 条）**，并且不止纯函数：用假 elector + 假受监督 spawner 真把控制器跑起来，分别断言 `retain`（保留并标记）与 `release`（删除，k8s 不变）；
+4. `test/db.test.mjs` 扩：迁移 v5 在 **SQLite 与 PG 两侧**都能把旧库升上来（含 `paused` 可写）。 　**⚠️ 只写了测试，本机跑不了**：见下。
+
+> **P2 的 SQLite 侧另有真引擎验证（补上本机跑不了 `test/db.test.mjs` 的缺口）**：本机 `better-sqlite3` 无 android-arm64 绑定，但 Node 24 自带 `node:sqlite`。于是把 **`lib/db/schema.js` 里那五段 SQLite 迁移原文抽出来**（抽取，不是复制）喂给真 SQLite，验四件事：
+> - **A. 阳性对照**：v1..v4 确实**拒绝** `paused`（证明"是 v5 打开了这个值"，而不是它本来就允许）；
+> - **B.** 全新库跑到 v5：6 个状态全接受、`'bogus'` 仍被拒、不留 `dsh_instances_v5` 残表；
+> - **C.** 带数据的旧库：`SELECT *` 逐字段与重建前**完全相同**（含 v4 加的 `patch`），`paused` 可写，且 `REFERENCES users(id)` **仍然生效**（插孤儿行报 FOREIGN KEY）；
+> - **D.** 重入性：连做两次 v5 仍只剩 1 行且值未变（真跑两次不会丢数据）。
+>
+> **PG 侧仍未验证**（本机无 PG、无 Docker）：`DO $$ … pg_constraint … %I … $$` 那段只经过人工复核。两处要留意：① 它依赖"无参数多语句"走 pg 的 simple-query 路径（既有迁移本来就是这条路）；② 用 `conname LIKE '%status%'` **按名查找**而非硬编码 `dsh_instances_status_check`，是为了避免"猜错名字 ⇒ 旧约束仍在 ⇒ 新约束形同虚设"。**首次在有 PG 的环境跑迁移时必须人看一眼**。
 
 **必须在真机核（每条都是对一个外部假设的验证）：**
 
@@ -311,6 +338,8 @@ CubeEgress 的做法是**L7 代理按域注入凭据，密钥对沙箱代码不�
 | 5 | 端口映射区间与自动分配行为 | 建多个沙箱看宿主端口 |
 | 6 | 沙箱 → 宿主服务 shortcut 是否真通 | 沙箱内 curl 控制面 API |
 | 7 | 跨节点 pause/resume（preview）是否可用 | 挂起后能否在另一节点恢复 |
+| 8 | **`list` 是否包含 `paused` 沙箱**（P2 新发现的前提） | 挂起一台 → `list()` 看它还在不在。**若不在**，`planReconcile` 每 tick 都会把该用户判为"缺失"并 `launch` —— 好在 `launch` 先查 `info`，会 `resume` 而不是**再建一台**，所以后果是多余往返而非重复沙箱（这一点已写在 `listUserPods` 的注释里）。真机读数决定要不要给 `list` 加一个显式状态过滤参数 |
+| 9 | 沙箱 API 的错误形状（404 vs 403 vs 传输失败） | 造一个不存在的 id、用坏 key、断网，三种各看一次 —— `SandboxClient.info` 的"缺席 ≠ 失败"纪律（P1 的 `SandboxNotFoundError`）依赖它 |
 
 **资源前提（已侦察，不满足则 §13 全部做不了）**：官方最低 **4 核 / 8 GB / ≥50 GB XFS 数据盘**（PVM 路线**不需要 `/dev/kvm`**，但**要换内核并重启**）。现有生产机 2 核 / 3.6 GB / 剩 9.3 GB 且**单盘单分区** ⇒ **不满足**，且换内核会降级到 6.6.117（现为 6.6.119）。**结论：另开一台 CVM 专门跑沙箱，控制面继续留在生产机** —— 也正好就是本文的网络形态。
 
@@ -322,7 +351,7 @@ CubeEgress 的做法是**L7 代理按域注入凭据，密钥对沙箱代码不�
 |---|---|---|---|
 | **P0** | 把线上未回流的三段热修（token / WS / panel-host）回流进 `src/` | 需要能构建的环境（本机缺原生依赖，建议服务器 Node 24） | `tsc` + `node --test` 全绿；[panel-hotfix-reflow.md](../fork/panel-hotfix-reflow.md) 作对照 |
 | **P1** | `SandboxClient` 抽象 + `fake-client` + `cubesandbox-spawner` + 单测 | 无（不需要真沙箱） | §13 的 1、3 组测试全绿 |
-| **P2** | `reconcile` 抽出 `SupervisedSpawner`；`deployMode` 加 `'cubesandbox'`；迁移 v5 | P1 | §13 的 3、4 组测试全绿；`local`/`k8s` 行为零变化 |
+| **P2** | `reconcile` 抽出 `SupervisedSpawner`；`deployMode` 加 `'cubesandbox'`；迁移 v5 | P1 | §13 的 3、4 组测试全绿；`local`/`k8s` 行为零变化 —— **✅ 已完成（见 §17）** |
 | **P3** | 真机打通：模板（dsh 装进镜像）+ Volume + AutoPause/Resume | 新 CVM（PVM 内核） | §13 的 7 条真机假设逐条出读数 |
 | **P4** | per-task 面（表 + service + 路由） | P1 的 client 抽象 | `test/task-sandbox.test.mjs` |
 | **P5** | CubeEgress 凭据注入（产品决策，可延后/可取消） | P3 | 沙箱内无密钥仍能调模型 |
@@ -407,3 +436,39 @@ test/db                   →  本机不可运行（见下）
 
 **顺带发现的一个上游缺陷（本刀未修，建议另开一刀）**：`k8s-spawner.ts:411` 的 `args.splice(1, 0, '--patch', …)` 把 `--patch` 插到了 `--profile` 与它的值 `web` **之间**，而 `orchestrator.ts:166-171` 的注释恰好写明这条规则（`--patch` 必须在 `--host`/`--port` 之前、`--profile <name>` 之后）。k8s 分支从未实机跑过，所以一直没暴露。修法一行：`splice(1` → `splice(2`。
 
+
+### P2（已完成）
+
+| 文件 | 内容 |
+|---|---|
+| `src/supervisor/spawner.ts` | `InstanceStatus` 加 `'paused'`；新增 `IdlePolicy`、`LiveWatcher`、`SupervisedSpawner`、`isSupervisedSpawner()` |
+| `src/supervisor/reconcile.ts` | 依赖 `SupervisedSpawner`（不再是具体类 `K8sSpawner`）；`planReconcile` 认 `paused` 并新增 `markRunning`；空闲回收按 `idlePolicy` 分岔；**去掉最后一条 k8s import** |
+| `src/db/types.ts` | `DshInstanceStatus` 镜像加 `'paused'`（§7 表里"最容易漏的一处"） |
+| `src/db/schema.ts` | 迁移 **v5**：SQLite 重建表 / PG 按名换约束 |
+| `src/supervisor/k8s-spawner.ts` | `implements SupervisedSpawner` + `idlePolicy = 'release'` |
+| `src/supervisor/cubesandbox-spawner.ts` | `implements SupervisedSpawner`；`idlePolicy = 'retain'`；`paused → 'paused'`；`listLiveInstances` → `listUserPods`；新增 `ensureUserResources` / 轮询 `watchMainPods` / `setFencing`（栅栏标签） |
+| `src/config.ts` | `DeployMode` 加 `'cubesandbox'`；`CubeSandboxConfig.watchIntervalMs` |
+| `src/sandbox/provider.ts`（新） | `createSandboxClient()` —— **P3 的接缝，现在抛异常** |
+| `src/web/server.ts` / `src/cli.ts` | 第三分支；`as K8sSpawner` 换成 `isSupervisedSpawner()` |
+| `src/fs/provider.ts` | cubesandbox 分支**响亮失败**（不静默摸错盘） |
+| `test/reconcile.test.mjs`（新） | 12 条 |
+| `test/cubesandbox-spawner.test.mjs` | 17 → **22 条**（翻转 P1 钉下的 `paused` 断言 + 5 条新成员） |
+| `test/db.test.mjs` | +1 条（`paused` 可写 / `'bogus'` 仍被拒） |
+| `package.json` | `test` 脚本登记 `test/reconcile.test.mjs` |
+
+**验收读数**（本机 Node v24.18.0）：
+
+```
+tsc -p tsconfig.json --noEmit  → 0 错
+test/reconcile                 → 12/12 通过（新）
+test/cubesandbox-spawner       → 22/22 通过
+test/k8s-spawner               →  7/7 通过   ← 回归锁（k8s 行为零变化）
+test/leader                    →  6/6 通过   ← 回归锁
+test/local-user-fs             →  5/5 通过   ← 回归锁
+test/db                        → 本机不可运行（better-sqlite3 无 android-arm64 绑定）
+v5 SQLite 重建（真引擎 node:sqlite，抽 lib 里的 SQL 原文跑）→ A/B/C/D 四组全过（见 §13）
+```
+
+**与本文的三处有意偏离**（§5/§7/§9 各有一段说明）：① `proxy.ts` 的 `=== 'local'` **复核后不动**（语义是"endpoint 是否回环"，沙箱永远不是）；② 迁移 v5 **只加 `paused`，不加三个新列**（加列不需重建，"一次做完"不成立）；③ 不调 `spawner.resume()`，改为**只观察** `markRunning`（AutoResume 是数据面触发的，控制面再发一次只会把唤醒延迟叠一倍）。
+
+**P2 结束后的真实可达性**：`deployMode: 'cubesandbox'` **能在配置层被接受，但一启动就抛**（客户端 P3）。这是刻意的 fail-closed，不是遗漏 —— 三个未实现接缝（客户端、`UserFs`、以及"没有人给 cube 传 template"）都会在启动或首次 launch 时**指名道姓**地报错。**`local`/`k8s` 两条线上路径行为零变化**。

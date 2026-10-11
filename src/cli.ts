@@ -19,7 +19,7 @@ import { hashPassword } from './web/auth.js'
 import { hashUid } from './isolation.js'
 import { LeaderElector } from './supervisor/leader.js'
 import { ReconcileController } from './supervisor/reconcile.js'
-import { K8sSpawner } from './supervisor/k8s-spawner.js'
+import { isSupervisedSpawner } from './supervisor/spawner.js'
 import { buildFileService, FILE_SERVICE_PORT, USER_ROOT_ENV } from './web/file-service.js'
 import { startTcpBridge } from './tcp-bridge.js'
 import { buildServer } from './web/server.js'
@@ -138,11 +138,17 @@ async function runServer(args: string[]): Promise<void> {
   app.log.info(`dsh-server-login listening on http://${config.host}:${actualPort}`)
   app.log.info(`data root: ${config.dataRoot}; db: ${config.dbPath}`)
 
-  // In k8s mode, only the elected leader runs the controller (reconcile + Pod
-  // watch). The web layer serves on every replica.
+  // Under a supervised backend, only the elected leader runs the controller
+  // (reconcile + live watch). The web layer serves on every replica. The
+  // capability check replaces a blind cast: `buildServer` hands back a Spawner,
+  // so a deploy mode that forgets a supervised implementation must fail *here*
+  // rather than at the first tick.
   let controller: ReconcileController | undefined
-  if (config.deployMode === 'k8s') {
-    const spawner = app.supervisor as K8sSpawner
+  if (config.deployMode === 'k8s' || config.deployMode === 'cubesandbox') {
+    const spawner = app.supervisor
+    if (!isSupervisedSpawner(spawner)) {
+      throw new Error(`deploy mode "${config.deployMode}" has no supervised spawner`)
+    }
     const elector = new LeaderElector({ namespace: config.k8sNamespace, identity: config.podName })
     controller = new ReconcileController(app.db, spawner, elector)
     await controller.start()

@@ -14,7 +14,7 @@ import type { DbAdapter } from '../db/adapter.js'
 import { HANDOFF_FILE, HOME_DIR, USERS_DIR, WORKSPACE_DIR } from '../fs/workspace.js'
 import { FILE_SERVICE_PORT, USER_ROOT_ENV } from '../web/file-service.js'
 import type { Fencing } from './leader.js'
-import { AlreadyRunningError, type Endpoint, type Instance, type LivePod, type Spawner, type UserStatus } from './spawner.js'
+import { AlreadyRunningError, type Endpoint, type IdlePolicy, type Instance, type LivePod, type SupervisedSpawner, type UserStatus } from './spawner.js'
 
 /** Loopback port the dsh container binds; the socat sidecar bridges 8081 → 8080. */
 const DSH_LOOPBACK_PORT = 8080
@@ -119,7 +119,10 @@ function stampFencing(labels: Record<string, string>, fencing: Fencing | undefin
  * K8s backend implementing {@link Spawner}. State lives in the cluster; every
  * method is a K8s API call (or a read).
  */
-export class K8sSpawner implements Spawner {
+export class K8sSpawner implements SupervisedSpawner {
+  /** k8s releases an idle user's Pod and its desired row: the next request
+   * cold-starts from the volume. The sandbox backend retains instead. */
+  readonly idlePolicy: IdlePolicy = 'release'
   private readonly core: k8s.CoreV1Api
   private readonly networking: k8s.NetworkingV1Api
   private readonly batch: k8s.BatchV1Api

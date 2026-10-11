@@ -67,8 +67,18 @@ export interface Domain {
 /** Which half of a user's DSH pair a `dsh_instances` row describes. */
 export type DshInstanceRole = 'main' | 'watchdog'
 
-/** Lifecycle state of a `dsh_instances` row (mirrors the column's CHECK). */
-export type DshInstanceStatus = 'starting' | 'running' | 'crashed' | 'repairing' | 'stopped'
+/** Lifecycle state of a `dsh_instances` row (mirrors the column's CHECK).
+ *
+ * `paused` is written by the reconcile idle-reap step for a backend whose
+ * `idlePolicy` is `retain` (CubeSandbox): the row survives the user going idle
+ * so the next request resumes the sandbox instead of cold-starting it. */
+export type DshInstanceStatus =
+  | 'starting'
+  | 'running'
+  | 'crashed'
+  | 'repairing'
+  | 'stopped'
+  | 'paused'
 
 /**
  * A persisted DSH instance — the **desired** state the k8s controller reconciles

@@ -9,6 +9,11 @@
 >
 > **本仓新增（上游没有）**：CubeSandbox 执行后端 —— 同时支持 **per-user 长期沙箱** 与
 > **per-task 一次性沙箱**；方案与上游接缝坐标见 [docs/plan/cubesandbox-backend.md](docs/plan/cubesandbox-backend.md)。
+>
+> 进度：**P1**（`SandboxClient` 抽象 + 假客户端 + `CubesandboxSpawner`）与 **P2**（`SupervisedSpawner` 收口 +
+> `deployMode` 第三值 + 迁移 v5 的 `paused` 状态）**已落地并有测试**；**P3**（真实客户端 + 首台沙箱）未开始。
+> `deployMode: 'cubesandbox'` 现在**可用配置、但启动即抛**，指名报出缺哪个阶段 —— 刻意的 fail-closed，
+> **`local` / `k8s` 两条线上路径行为零变化**。进度表见方案 §14、实施记录见 §17。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 

@@ -14,16 +14,20 @@ import { join } from 'node:path'
 export type IsolationMode = 'soft' | 'account'
 
 /** Deployment mode. `local` = single-host child_process (setuid/iptables);
- * `k8s` = multi-replica control plane spawning per-user DSH Pods via the K8s API. */
-export type DeployMode = 'local' | 'k8s'
+ * `k8s` = multi-replica control plane spawning per-user DSH Pods via the K8s
+ * API; `cubesandbox` = one long-lived CubeSandbox micro-VM per user, whose idle
+ * state is a whole-machine snapshot rather than a deleted workload. */
+export type DeployMode = 'local' | 'k8s' | 'cubesandbox'
 
 /**
  * Sandbox-backend settings (CubeSandbox).
  *
  * Resolved in **every** mode (so a typo is caught at startup and a `local`/`k8s`
  * deployment needs no sandbox config at all); only the cubesandbox backend reads
- * them. Wiring the third `deployMode` value is phase P2
- * (docs/plan/cubesandbox-backend.md §14).
+ * them. `deployMode: 'cubesandbox'` is accepted as of P2, but two seams are
+ * still P3 and therefore fail **loudly** at startup instead of silently doing
+ * the wrong thing: the sandbox API client (`src/sandbox/provider.ts`) and the
+ * sandbox-backed `UserFs` (`src/fs/provider.ts`).
  */
 export interface CubeSandboxConfig {
   /** Sandbox control-plane API base URL (e.g. `https://cube.internal:3000`). */
@@ -40,6 +44,8 @@ export interface CubeSandboxConfig {
   dshPort: number
   /** How long to wait for a created sandbox to report `running`, in ms. */
   readyTimeoutMs: number
+  /** How often the live-instance watch polls (this backend has no informer), in ms. */
+  watchIntervalMs: number
 }
 
 /** Resolved, immutable runtime configuration. */
@@ -168,6 +174,7 @@ const DEFAULT_CUBESANDBOX_DSH_COMMAND = ['dsh']
 const DEFAULT_CUBESANDBOX_VOLUME_MOUNT = '/var/lib/dsh-server-login'
 const DEFAULT_CUBESANDBOX_DSH_PORT = 8080
 const DEFAULT_CUBESANDBOX_READY_TIMEOUT_MS = 60_000
+const DEFAULT_CUBESANDBOX_WATCH_INTERVAL_MS = 10_000
 
 /**
  * Resolve the sandbox-backend settings.
@@ -200,6 +207,11 @@ export function resolveCubeSandboxConfig(
       overrides.readyTimeoutMs ??
         (env.DSH_SERVER_LOGIN_CUBESANDBOX_READY_TIMEOUT_MS || undefined) ??
         DEFAULT_CUBESANDBOX_READY_TIMEOUT_MS,
+    ),
+    watchIntervalMs: Number(
+      overrides.watchIntervalMs ??
+        (env.DSH_SERVER_LOGIN_CUBESANDBOX_WATCH_INTERVAL_MS || undefined) ??
+        DEFAULT_CUBESANDBOX_WATCH_INTERVAL_MS,
     ),
   }
 }
@@ -243,12 +255,12 @@ function toIsolationMode(value: string | undefined): IsolationMode | undefined {
   throw new Error(`invalid isolation mode "${value}" (expected "soft" or "account")`)
 }
 
-/** Parse a deploy-mode value, rejecting anything outside `local`/`k8s`. */
+/** Parse a deploy-mode value, rejecting anything outside `local`/`k8s`/`cubesandbox`. */
 function toDeployMode(value: string | undefined): DeployMode | undefined {
   if (value === undefined) return undefined
   const normalized = value.trim().toLowerCase()
-  if (normalized === 'local' || normalized === 'k8s') return normalized
-  throw new Error(`invalid deploy mode "${value}" (expected "local" or "k8s")`)
+  if (normalized === 'local' || normalized === 'k8s' || normalized === 'cubesandbox') return normalized
+  throw new Error(`invalid deploy mode "${value}" (expected "local", "k8s" or "cubesandbox")`)
 }
 
 /**

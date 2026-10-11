@@ -153,6 +153,28 @@ function register(backend, makeAdapter) {
     }
   })
 
+  test(`${backend}: migration v5 lets status be 'paused'`, async () => {
+    // Guards the v5 rebuild: on SQLite the CHECK cannot be altered, so the table
+    // is recreated — and this is what proves the new constraint is the one in
+    // place. 'paused' must be accepted, and everything else still rejected.
+    const db = await makeAdapter()
+    try {
+      await db.createUser(user('a', 'alice'))
+      await db.upsertInstance({ id: 'dsh-a', userId: 'a', role: 'main', status: 'paused', folder: '/ws' })
+      assert.equal((await db.findInstance('dsh-a')).status, 'paused', 'a paused row round-trips')
+
+      assert.equal(await db.setInstanceStatus('dsh-a', 'paused'), true, 'and is writable by the idle-reap step')
+      assert.equal((await db.findInstance('dsh-a')).status, 'paused')
+
+      await assert.rejects(
+        () => db.upsertInstance({ id: 'dsh-b', userId: 'a', role: 'main', status: 'bogus' }),
+        'the rebuilt CHECK still rejects an unknown status',
+      )
+    } finally {
+      await db.close()
+    }
+  })
+
   test(`${backend}: instances are scoped by user and role, and cascade on user delete`, async () => {
     const db = await makeAdapter()
     try {

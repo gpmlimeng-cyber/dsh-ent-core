@@ -30,13 +30,16 @@ import {
   type SandboxSpec,
   type SandboxState,
 } from '../sandbox/client.js'
+import type { Fencing } from './leader.js'
 import {
   AlreadyRunningError,
   type Endpoint,
+  type IdlePolicy,
   type Instance,
   type InstanceStatus,
   type LivePod,
-  type Spawner,
+  type LiveWatcher,
+  type SupervisedSpawner,
   type UserStatus,
 } from './spawner.js'
 
@@ -66,9 +69,16 @@ function names(userId: string): { sandbox: string; volume: string } {
   return { sandbox: `dsh-${userId}`, volume: `dsh-vol-${userId}` }
 }
 
-/** Labels stamped on every sandbox this backend creates. */
-function sandboxLabels(userId: string): Record<string, string> {
-  return { app: APP_LABEL, user: userId, [MANAGED_BY_KEY]: MANAGED_BY_VALUE }
+/** Labels stamped on every sandbox this backend creates. The fencing pair
+ * mirrors `K8sSpawner` (`k8s-spawner.ts:112`), so a successor can identify work
+ * a dead leader left in flight. */
+function sandboxLabels(userId: string, fencing?: Fencing): Record<string, string> {
+  const labels: Record<string, string> = { app: APP_LABEL, user: userId, [MANAGED_BY_KEY]: MANAGED_BY_VALUE }
+  if (fencing !== undefined) {
+    labels['dsh.io/holder'] = fencing.holder
+    labels['dsh.io/operation-id'] = String(fencing.operationId)
+  }
+  return labels
 }
 
 /** Per-user paths **inside** the sandbox; the volume is mounted at `mount`.
@@ -91,21 +101,26 @@ function quoteCommand(argv: readonly string[]): string {
 /**
  * Sandbox state → upstream `InstanceStatus`.
  *
- * `paused` currently reports as `'stopped'`: neither the shared
- * `InstanceStatus` union nor the two `dsh_instances.status` CHECK constraints
- * know `paused` yet, and adding it means changing all four mirrors in one go
- * (§7). P2 does that migration and flips this mapping — the test that pins it
- * says so by name.
+ * `paused` maps to itself: the row keeps saying `paused` while the snapshot is
+ * held, which is what tells the reconcile idle-reap loop not to write it again
+ * every tick (`reconcile.ts`). The two DB mirrors and both CHECK constraints
+ * carry the value as of migration v5.
  */
 function toInstanceStatus(state: SandboxState): InstanceStatus {
   if (state === 'running') return 'running'
   if (state === 'starting') return 'starting'
   if (state === 'error') return 'crashed'
+  if (state === 'paused') return 'paused'
   return 'stopped'
 }
 
 /** The CubeSandbox per-user backend. */
-export class CubesandboxSpawner implements Spawner {
+export class CubesandboxSpawner implements SupervisedSpawner {
+  /** Idle means **pause**, not release: the desired `dsh_instances` row survives
+   * so the user's next request resumes the snapshot instead of cold-starting. */
+  readonly idlePolicy: IdlePolicy = 'retain'
+  private fencing: Fencing | undefined
+
   constructor(
     private readonly config: ServerConfig,
     private readonly db: DbAdapter,
@@ -134,7 +149,7 @@ export class CubesandboxSpawner implements Spawner {
       template: this.config.cubesandbox.template,
       env,
       volumes: [{ name: volume, mountPath: mount }],
-      labels: sandboxLabels(userId),
+      labels: sandboxLabels(userId, this.fencing),
     }
     if (this.config.enablePatch && patch !== undefined) spec.files = { [PATCH_PATH]: patch }
     const info = await this.client.create(spec)
@@ -217,9 +232,9 @@ export class CubesandboxSpawner implements Spawner {
     await this.client.pause(existing.id)
     // The desired `dsh_instances` row is deliberately **not** deleted here,
     // unlike the k8s backend. Under this backend the row *is* the user's
-    // long-lived claim on their sandbox; P2's reconcile marks it `paused`
-    // instead of dropping it (§9) — so the row's fate belongs to that caller,
-    // not to `stop`.
+    // long-lived claim on their sandbox, so its fate belongs to the reconcile
+    // idle-reap caller, which marks it `paused` instead of dropping it (§9) —
+    // this method only decides *how* the instance stops.
   }
 
   async teardown(): Promise<void> {
@@ -237,12 +252,25 @@ export class CubesandboxSpawner implements Spawner {
 
   /** Ensure the user's volume exists (it is the mount the DSH sandbox needs). */
   async ensureFileService(userId: string): Promise<void> {
+    await this.ensureUserResources(userId)
+  }
+
+  /** The sandbox backend's per-user resource is the volume. Called every
+   * reconcile tick for every desired instance (including paused ones), so it
+   * must stay cheap and idempotent. */
+  async ensureUserResources(userId: string): Promise<void> {
     await this.client.ensureVolume(names(userId).volume)
   }
 
-  /** Live sandboxes in the shape `planReconcile` diffs. P1 exposes the mapping;
-   * P2 wires it into the `SupervisedSpawner` the controller depends on. */
-  async listLiveInstances(): Promise<LivePod[]> {
+  /** Live sandboxes in the shape `planReconcile` diffs.
+   *
+   * ★ Invariant this relies on: the sandbox API's `list` must include **paused**
+   * sandboxes. If it did not, a paused user would look "missing" every tick and
+   * be relaunched — though `launch` would then resume the existing sandbox
+   * rather than create a second one (it re-checks `info` first), so the failure
+   * mode is a wasted round-trip, not a duplicate sandbox. Real-machine
+   * verification item (§13). */
+  async listUserPods(): Promise<LivePod[]> {
     const owned = await this.client.list({ labels: { app: APP_LABEL, [MANAGED_BY_KEY]: MANAGED_BY_VALUE } })
     return owned.map((sandbox) => ({
       name: sandbox.id,
@@ -250,6 +278,53 @@ export class CubesandboxSpawner implements Spawner {
       running: sandbox.state === 'running',
       crashed: sandbox.state === 'error',
     }))
+  }
+
+  /**
+   * Watch live sandboxes by **polling** — this backend has no informer.
+   *
+   * Emits every managed sandbox on every poll rather than only on change. That
+   * is safe because the controller's crash path is guarded by its own
+   * "already fired" set (`reconcile.ts` `watchdogFired`), so a repeated emit for
+   * a crashed sandbox does not spawn a second watchdog, and a healthy emit is a
+   * no-op. Best-effort: a failed poll logs and retries on the next interval, so
+   * the reconcile tick still converges if the watch never works at all.
+   */
+  watchMainPods(callback: (pod: LivePod) => void): LiveWatcher {
+    let timer: NodeJS.Timeout | undefined
+    let stopped = false
+    const poll = async (): Promise<void> => {
+      if (stopped) return
+      try {
+        for (const pod of await this.listUserPods()) callback(pod)
+      } catch (err) {
+        this.logError(err)
+      }
+      if (stopped) return
+      timer = setTimeout(() => void poll(), this.config.cubesandbox.watchIntervalMs)
+      timer.unref?.()
+    }
+    return {
+      start: async () => {
+        stopped = false
+        await poll()
+      },
+      stop: async () => {
+        stopped = true
+        if (timer !== undefined) {
+          clearTimeout(timer)
+          timer = undefined
+        }
+      },
+    }
+  }
+
+  /** Stamp the current leader's fencing token onto the sandboxes created from
+   * now on. Mirrors `K8sSpawner.setFencing`: the token is telemetry for a human
+   * (nothing in this repo reads it back), so an unstamped sandbox is harmless —
+   * which is why no reconciliation is attempted for the ones already created. */
+  setFencing(fencing: Fencing | undefined): void {
+    this.fencing = fencing
   }
 
   /** Best-effort error surface for the controller's tick loop. */

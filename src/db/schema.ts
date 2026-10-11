@@ -214,6 +214,73 @@ ALTER TABLE dsh_instances ADD COLUMN folder TEXT;
 ALTER TABLE dsh_instances ADD COLUMN patch TEXT;
 `
 
+// v5: `paused` on `dsh_instances.status`, written by the reconcile idle-reap for
+// a backend that keeps the user's instance (CubeSandbox — see
+// docs/plan/cubesandbox-backend.md §7/§9). Both dialects must move together:
+// the CHECK exists once per dialect and `types.ts` mirrors it.
+//
+// SQLite cannot ALTER a CHECK constraint, so the table is rebuilt
+// (create → copy → drop → rename). Safe here because `dsh_instances` has **no
+// inbound** foreign keys — it only references `users`/`workspaces` — so no other
+// table's DDL moves. `PRAGMA foreign_keys=off` is deliberately not used:
+// `runSqliteMigrations` wraps every migration in one transaction, inside which
+// that pragma is a no-op. The copy below therefore satisfies the foreign keys as
+// they stand (they do: rows are already constrained by v1's REFERENCES).
+//
+// The old `dsh_instances` is dropped *after* the copy and the new table is
+// renamed into place, so a failure anywhere rolls the whole migration back and
+// leaves the original table intact.
+const SQLITE_V5 = `
+CREATE TABLE dsh_instances_v5 (
+  id           TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  workspace_id TEXT REFERENCES workspaces(id),
+  role         TEXT NOT NULL CHECK (role IN ('main','watchdog')),
+  pid          INTEGER,
+  port         INTEGER,
+  status       TEXT NOT NULL
+               CHECK (status IN ('starting','running','crashed','repairing','stopped','paused')),
+  started_at   INTEGER,
+  last_exit    INTEGER,
+  exit_code    INTEGER,
+  last_error   TEXT,
+  folder       TEXT,
+  patch        TEXT
+);
+
+INSERT INTO dsh_instances_v5
+  (id, user_id, workspace_id, role, pid, port, status, started_at, last_exit, exit_code, last_error, folder, patch)
+SELECT
+   id, user_id, workspace_id, role, pid, port, status, started_at, last_exit, exit_code, last_error, folder, patch
+FROM dsh_instances;
+
+DROP TABLE dsh_instances;
+ALTER TABLE dsh_instances_v5 RENAME TO dsh_instances;
+`
+
+// Postgres can alter a CHECK in place. The column-level CHECK created by v1 was
+// auto-named by Postgres, so the drop looks the name up instead of assuming it
+// (`dsh_instances_status_check` is only the conventional guess): dropping by
+// pattern cannot leave an older, stricter constraint behind, which a plain
+// `DROP CONSTRAINT IF EXISTS <guess>` would.
+const PG_V5 = `
+DO $$
+DECLARE constraint_name text;
+BEGIN
+  FOR constraint_name IN
+    SELECT conname FROM pg_constraint
+     WHERE conrelid = 'dsh_instances'::regclass
+       AND contype = 'c'
+       AND conname LIKE '%status%'
+  LOOP
+    EXECUTE format('ALTER TABLE dsh_instances DROP CONSTRAINT %I', constraint_name);
+  END LOOP;
+END $$;
+
+ALTER TABLE dsh_instances ADD CONSTRAINT dsh_instances_status_check
+  CHECK (status IN ('starting','running','crashed','repairing','stopped','paused'));
+`
+
 interface Migration {
   version: number
   name: string
@@ -226,6 +293,7 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 2, name: 'credential vault enabled flag', sqlite: SQLITE_V2, pg: PG_V2 },
   { version: 3, name: 'per-user uid', sqlite: SQLITE_V3, pg: PG_V3 },
   { version: 4, name: 'instance desired state', sqlite: SQLITE_V4, pg: PG_V4 },
+  { version: 5, name: 'paused instance status', sqlite: SQLITE_V5, pg: PG_V5 },
 ]
 
 /** Apply unapplied SQLite migrations inside a single transaction. */
