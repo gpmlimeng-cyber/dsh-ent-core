@@ -472,3 +472,53 @@ v5 SQLite 重建（真引擎 node:sqlite，抽 lib 里的 SQL 原文跑）→ A/
 **与本文的三处有意偏离**（§5/§7/§9 各有一段说明）：① `proxy.ts` 的 `=== 'local'` **复核后不动**（语义是"endpoint 是否回环"，沙箱永远不是）；② 迁移 v5 **只加 `paused`，不加三个新列**（加列不需重建，"一次做完"不成立）；③ 不调 `spawner.resume()`，改为**只观察** `markRunning`（AutoResume 是数据面触发的，控制面再发一次只会把唤醒延迟叠一倍）。
 
 **P2 结束后的真实可达性**：`deployMode: 'cubesandbox'` **能在配置层被接受，但一启动就抛**（客户端 P3）。这是刻意的 fail-closed，不是遗漏 —— 三个未实现接缝（客户端、`UserFs`、以及"没有人给 cube 传 template"）都会在启动或首次 launch 时**指名道姓**地报错。**`local`/`k8s` 两条线上路径行为零变化**。
+
+
+## 18. 机器采购清单（P3 前置）
+
+> 依据：官方 [Quick Start](https://github.com/TencentCloud/CubeSandbox/blob/master/docs/guide/quickstart.md) 与 [PVM 部署](https://github.com/TencentCloud/CubeSandbox/blob/master/docs/guide/pvm-deploy.md)（原文取回，**本仓未实测**）。
+
+### 官方硬门槛（逐条来自原文）
+
+| 项 | 要求 | 为什么 |
+|---|---|---|
+| 架构 | **x86_64** | PVM 宿主内核只发布 `*.x86_64.rpm` / `*_amd64.deb`；**ARM64 必须用自带 KVM 的裸金属**，走 Bare-Metal 而非 PVM |
+| 操作系统 | **OpenCloudOS 9**（官方推荐）/ TencentOS 4；其它发行版须 **glibc ≥ 2.31** | 二进制建在 Ubuntu 20.04（glibc 2.31）上 |
+| CPU | ≥ 4 核（官方"推荐"32 核） | |
+| 内存 | ≥ 8 GB（官方"推荐"64 GB） | |
+| `/data/cubelet` | **≥ 50 GB，且必须是 XFS**（建议独立数据盘；多模板/自定义镜像建议 200 GB+） | XFS **reflink** 是 CoW 快照的硬依赖 —— Ubuntu/Debian 默认 ext4，要手工另建 XFS |
+| 权限 / 网络 | root；能出网（要拉 release 包**和 Docker 镜像**） | |
+| 内核 | 装 PVM 内核 → `grubby --set-default-index` → **重启** → `modprobe kvm_pvm` | `CUBE_PVM_ENABLE=1`；`.env` 里的 `CUBE_PVM_ENABLE=0` 会**静默覆盖**它（官方明写这个坑） |
+
+装完自带：E2B 兼容 REST（**3000**）、CubeMaster / Cubelet / CubeShim（宿主进程）、**MySQL + Redis（Docker Compose）**、CubeProxy（mkcert TLS）+ CoreDNS（`cube.app`）。
+
+### 本仓选型（三档）
+
+| 档 | 规格 | 用途 | 判断 |
+|---|---|---|---|
+| 官方最低 | 4C / 8G / 50G | 只够跑通 quickstart | ✗ 一个模板镜像 + 若干挂起快照就到底 |
+| **起步档（建议买这个）** | **8C / 16G / 系统盘 60G + 200G XFS 数据盘** | P3 真机打通 + 小规模内测 | ✅ |
+| 放量档 | 16C+ / 32G+ / 500G+ | 数十并发活跃用户 | 等 §13 实测曲线；CVM 可在线升配，官方也支持 [多节点集群](https://github.com/TencentCloud/CubeSandbox/blob/master/docs/guide/multi-node-deploy.md) |
+
+**磁盘比 CPU/内存更该给足。** 盘上同时要放：模板镜像 + 可写层 + **每个挂起沙箱的整机快照（内存 + 文件系统）**。挂起只关掉 MicroVM，快照留在盘上（或转 S3）⇒ **磁盘容量随"总用户数"增长，内存随"同时清醒数"增长**。后者正是 §13 第 3 条（`paused_resource_release_ratio` 默认 0）要实测的假设，**在拿到读数前不要把内存按"总用户数"买**。
+
+### 下单要点
+
+- **同地域、同 VPC** —— 控制面走私网拨沙箱节点（§12），**不要走公网**
+- 机型：**标准型 / 计算型**；避开**突发性能型**（沙箱是持续负载，CPU 积分会被抽干）
+- 镜像：**OpenCloudOS 9.x 64 位**（默认 XFS，省掉 Ubuntu 手工建 XFS 那一步）
+- 数据盘：200 GB SSD → 挂 `/data`，XFS
+- 安全组：**一律不对公网开** CubeProxy 的 80/443、E2B 的 3000、以及端口映射区间（宿侧端口由 Cubelet 自动分配）；只对内网放行控制面 + 运维口
+- 计费：**按量付费**先跑通，P3 出读数后再定包月规格
+
+**不要买**：ARM 机型 · GPU（roadmap 未提供）· 试图装在**生产箱**上（80 是 ACME http-01 唯一通道，且换内核要重启生产站 —— §12/§13）。
+
+### 到手后先回三个读数
+
+```bash
+uname -m        # 必须 x86_64
+free -g         # 目标 ≥ 8
+df -hT /data    # 目标 ≥ 50G，且 Type 列必须是 xfs
+```
+
+再按 §13 的 9 条清单逐条出真机读数。
