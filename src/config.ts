@@ -17,6 +17,31 @@ export type IsolationMode = 'soft' | 'account'
  * `k8s` = multi-replica control plane spawning per-user DSH Pods via the K8s API. */
 export type DeployMode = 'local' | 'k8s'
 
+/**
+ * Sandbox-backend settings (CubeSandbox).
+ *
+ * Resolved in **every** mode (so a typo is caught at startup and a `local`/`k8s`
+ * deployment needs no sandbox config at all); only the cubesandbox backend reads
+ * them. Wiring the third `deployMode` value is phase P2
+ * (docs/plan/cubesandbox-backend.md §14).
+ */
+export interface CubeSandboxConfig {
+  /** Sandbox control-plane API base URL (e.g. `https://cube.internal:3000`). */
+  endpoint: string
+  /** API key for the sandbox control plane; empty = unauthenticated (dev only). */
+  apiKey: string
+  /** Template every per-user sandbox is created from (must carry the DSH CLI). */
+  template: string
+  /** argv run **inside** the sandbox to start DSH. Host paths do not exist there. */
+  dshCommand: string[]
+  /** Path the per-user volume is mounted at inside the sandbox. */
+  volumeMountPath: string
+  /** Loopback port DSH binds inside the sandbox (mapped out as `SandboxInfo.port`). */
+  dshPort: number
+  /** How long to wait for a created sandbox to report `running`, in ms. */
+  readyTimeoutMs: number
+}
+
 /** Resolved, immutable runtime configuration. */
 export interface ServerConfig {
   /** Bind host for the orchestrator HTTP server. */
@@ -74,6 +99,9 @@ export interface ServerConfig {
   k8sServiceAccount: string
   /** This replica's identity for leader election (POD_NAME, else hostname). */
   podName: string
+  /** Sandbox backend settings (see {@link CubeSandboxConfig}); only the
+   * cubesandbox backend reads them, but they resolve in every mode. */
+  cubesandbox: CubeSandboxConfig
 }
 
 /** Untyped overrides collected from argv / env. */
@@ -105,6 +133,7 @@ export interface ConfigOverrides {
   egressCidrs?: string[]
   k8sServiceAccount?: string
   podName?: string
+  cubesandbox?: Partial<CubeSandboxConfig>
 }
 
 const DEFAULT_HOST = '127.0.0.1'
@@ -133,6 +162,47 @@ const DEFAULT_DEPLOY_MODE: DeployMode = 'local'
 const DEFAULT_K8S_NAMESPACE = 'dsh'
 const DEFAULT_K8S_SERVICE_ACCOUNT = 'dsh-orchestrator'
 const DEFAULT_IMAGE_PULL_SECRET = 'dsh-acr-pull'
+const DEFAULT_CUBESANDBOX_ENDPOINT = ''
+const DEFAULT_CUBESANDBOX_TEMPLATE = ''
+const DEFAULT_CUBESANDBOX_DSH_COMMAND = ['dsh']
+const DEFAULT_CUBESANDBOX_VOLUME_MOUNT = '/var/lib/dsh-server-login'
+const DEFAULT_CUBESANDBOX_DSH_PORT = 8080
+const DEFAULT_CUBESANDBOX_READY_TIMEOUT_MS = 60_000
+
+/**
+ * Resolve the sandbox-backend settings.
+ *
+ * `endpoint`/`template` may stay empty so a `local`/`k8s` deployment needs no
+ * sandbox configuration; the cubesandbox backend itself refuses to launch
+ * without a template. Unset **or empty** env vars fall back to the defaults,
+ * rather than parsing to `0`/`NaN` the way a bare `Number('')` would (a `0`
+ * dshPort would bind an ephemeral port and silently break the mapping).
+ */
+export function resolveCubeSandboxConfig(
+  overrides: Partial<CubeSandboxConfig> = {},
+  env: NodeJS.ProcessEnv = process.env,
+): CubeSandboxConfig {
+  const dshBin = env.DSH_SERVER_LOGIN_CUBESANDBOX_DSH_BIN
+  return {
+    endpoint: overrides.endpoint ?? env.DSH_SERVER_LOGIN_CUBESANDBOX_ENDPOINT ?? DEFAULT_CUBESANDBOX_ENDPOINT,
+    apiKey: overrides.apiKey ?? env.DSH_SERVER_LOGIN_CUBESANDBOX_API_KEY ?? '',
+    template: overrides.template ?? env.DSH_SERVER_LOGIN_CUBESANDBOX_TEMPLATE ?? DEFAULT_CUBESANDBOX_TEMPLATE,
+    dshCommand:
+      overrides.dshCommand ?? (dshBin !== undefined && dshBin !== '' ? [dshBin] : DEFAULT_CUBESANDBOX_DSH_COMMAND),
+    volumeMountPath:
+      overrides.volumeMountPath ??
+      (env.DSH_SERVER_LOGIN_CUBESANDBOX_VOLUME_ROOT || undefined) ??
+      DEFAULT_CUBESANDBOX_VOLUME_MOUNT,
+    dshPort: Number(
+      overrides.dshPort ?? (env.DSH_SERVER_LOGIN_CUBESANDBOX_DSH_PORT || undefined) ?? DEFAULT_CUBESANDBOX_DSH_PORT,
+    ),
+    readyTimeoutMs: Number(
+      overrides.readyTimeoutMs ??
+        (env.DSH_SERVER_LOGIN_CUBESANDBOX_READY_TIMEOUT_MS || undefined) ??
+        DEFAULT_CUBESANDBOX_READY_TIMEOUT_MS,
+    ),
+  }
+}
 
 /** Load the encryption secret from env, or persist a generated one at
  * `<dataRoot>/secret.key` (0600) so it survives restarts without setup. */
@@ -238,5 +308,6 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ServerConfig {
     k8sServiceAccount:
       overrides.k8sServiceAccount ?? process.env.DSH_SERVER_LOGIN_K8S_SERVICE_ACCOUNT ?? DEFAULT_K8S_SERVICE_ACCOUNT,
     podName: overrides.podName ?? process.env.POD_NAME ?? hostname(),
+    cubesandbox: resolveCubeSandboxConfig(overrides.cubesandbox),
   }
 }

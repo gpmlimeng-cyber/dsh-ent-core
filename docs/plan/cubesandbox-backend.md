@@ -367,3 +367,43 @@ CubeEgress 的做法是**L7 代理按域注入凭据，密钥对沙箱代码不�
 
 1. **文档漂移（规模比预想大）**：`src/` 里 **26 处**引用 `docs/k8s.md` 的章节（`§4.3/§4.4/§4.8/§4.9/§4.10/§5.1/§5.2/§5.4/§5.7/§5.8/§6.0-1`），但 **`docs/k8s.md` 不存在** —— 实际文件是 `docs/k8s-deploy.md`（20.9 KB）与 `docs/k8s-deployment.md`（6.5 KB）两个名字相近的文档。⇒ 读这些注释的人**永远找不到**对应章节；要么补一份 `docs/k8s.md`，要么把这 26 处指向真文件。
 2. **`reconcile.ts` 的类型泄漏**：构造函数（`:50-56`）与成员（`:52`）声明的是具体类 `K8sSpawner` 而非接口 —— 这是 §8 那个改动要处理的根因。
+
+---
+
+## 17. 实施记录
+
+### P1（已完成）
+
+| 文件 | 内容 |
+|---|---|
+| `src/sandbox/client.ts` | `SandboxClient` 接口 + 类型 + `SandboxNotFoundError`。**"缺席"与"失败"分离**（照 k8s 的 404/403 纪律：`info()` 只在真不存在时返回 `undefined`，其余失败照抛） |
+| `src/sandbox/fake-client.ts` | 内存假客户端：可注入失败、可强制状态、记录每次 exec —— 单测与本地 dry-run 共用 |
+| `src/supervisor/cubesandbox-spawner.ts` | `implements Spawner` 的 8 个方法 |
+| `src/config.ts` | 新增 `CubeSandboxConfig` + `resolveCubeSandboxConfig`（**只加配置字段，`deployMode` 第三值仍留 P2**） |
+| `test/cubesandbox-spawner.test.mjs` | 17 条 |
+
+**与本文方案的四处有意偏离**（都有代码注释 + 测试钉住）：
+
+1. **`SandboxClient` 是必填构造参数，不是可选第 5 参。** 方案 §4 设想"可选 + 默认真实客户端"，但真实客户端是 P3 才有的事物 ⇒ 给它一个会抛异常或装假的默认值，等于让"编译通过、部署必炸"成为可能。必填参数把"必须提供真客户端"变成类型约束。
+2. **不接收 `resolveUid`**：把 §4 那条减法落到签名上 —— 沙箱即隔离边界，不需要每用户 uid。
+3. **`paused` 在 P1 上报为 `'stopped'`**：`paused` 尚未进 `InstanceStatus` 与两条 CHECK（§7 要求四处同时改），而 P1 从不把该状态写进 DB，所以先做保收缩映射；**P2 迁移后必须翻转**（测试名已写明这一点）。
+4. **接口比 §3 的 7 个方法多两个**：`list`（`teardown` 与 P2 的 live 侧都需要"本后端持有的一切"）、`exec` 的 `background` 选项（dsh 是常驻进程，必须能分离启动）。
+
+**验收读数**（本机 Node v24.18.0）：
+
+```
+tsc -p tsconfig.json      → 0 错
+test/cubesandbox-spawner  → 17/17 通过（含 "--patch 必须在 --host 之前" 的 argv 锁）
+test/k8s-spawner          →  7/7 通过   ← 回归锁
+test/leader               →  6/6 通过   ← 回归锁
+test/local-user-fs        →  5/5 通过   ← 回归锁
+test/db                   →  本机不可运行（见下）
+```
+
+**两处环境限制（与本刀无关，如实记录）**：
+
+- `test/db.test.mjs` 需要 `better-sqlite3` 的原生绑定，本机（android-arm64）没有对应预编译产物 ⇒ 13 条全红。须在 Linux/Node 24 上跑。
+- 本机 `node --test <file>` 一律失败（子进程报 `expected absolute path: "--test-concurrency=0"`）——**未改动的上游测试文件同样失败**（`local-user-fs.test.mjs` 直跑 5/5、`--test` 直报错）。故测试改为 `node test/<file>.test.mjs` 逐个直跑：等价，且每条都真正执行了。
+
+**顺带发现的一个上游缺陷（本刀未修，建议另开一刀）**：`k8s-spawner.ts:411` 的 `args.splice(1, 0, '--patch', …)` 把 `--patch` 插到了 `--profile` 与它的值 `web` **之间**，而 `orchestrator.ts:166-171` 的注释恰好写明这条规则（`--patch` 必须在 `--host`/`--port` 之前、`--profile <name>` 之后）。k8s 分支从未实机跑过，所以一直没暴露。修法一行：`splice(1` → `splice(2`。
+
