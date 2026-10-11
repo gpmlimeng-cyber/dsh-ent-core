@@ -1,5 +1,9 @@
 # dsh-server-login
 
+> **本仓是 [pointer-a/dsh-server-login](https://github.com/pointer-a/dsh-server-login) 的独立二开仓**
+> （导入基线 commit `04bc832`，MIT）。上游关系与「**产物不是真源**」的铁律见 [FORK.md](FORK.md)，
+> 版权与归属见 [NOTICE](NOTICE)。以下正文为上游原文。
+
 [![build](https://github.com/pointer-a/dsh-server-login/actions/workflows/build.yml/badge.svg)](https://github.com/pointer-a/dsh-server-login/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 

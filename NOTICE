@@ -1,0 +1,43 @@
+DSH Enterprise Core (dsh-ent-core)
+==================================
+
+This repository is an independent secondary-development fork. It does not
+track, merge from, or contribute back to its upstream by default.
+
+Copyright and attribution
+-------------------------
+
+1. dsh-server-login (https://github.com/pointer-a/dsh-server-login)
+   - License: MIT
+   - Copyright (c) 2026 dsh-server-login contributors
+   - Import baseline: commit 04bc832ee8ffcff56dc551dc12845da4a4f2550d
+     ("fix:修复local模式与k8s的共用配置文件冲突 - 修复两个p0bug - 优化文档描述")
+   - The upstream LICENSE text is retained verbatim at ./LICENSE, and every
+     file reachable from the import baseline remains under that MIT grant.
+
+2. This fork (DSH Enterprise Core / dsh-ent-core)
+   - License: MIT
+   - Copyright (c) 2026 DSH Enterprise contributors
+   - Original work is everything after the import baseline; see `git log`.
+
+3. Third-party components
+   - See package.json / package-lock.json and the dependency trees they lock.
+
+4. Related repositories (same maintainer, separate concerns)
+   - dsh-enterprise (https://github.com/gpmlimeng-cyber/dsh-enterprise)
+     — enterprise monorepo (backend, console, Harness plugins)
+   - deepseek-harness (https://github.com/deepseek-ai/deepseek-harness)
+     — the upstream product this platform hosts
+
+Relationship to DeepSeek
+------------------------
+
+This is an independent community project. It is not affiliated with, endorsed
+by, or maintained by DeepSeek. "DeepSeek Harness" and "DSH" name the upstream
+product that this platform orchestrates.
+
+Ground rule
+-----------
+
+Build artifacts are NOT the source of truth. All changes go into `src/`
+first, then get built and deployed. See FORK.md, section 2.
