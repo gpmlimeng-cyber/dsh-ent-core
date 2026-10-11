@@ -1,14 +1,19 @@
-# dsh-server-login
+# dsh-ent-core
+
+> 仓名 **`dsh-ent-core`**；**包名仍为 `dsh-server-login`** —— 那是运行时身份（插件挂载 id、
+> `bin` 名、数据根 `/var/lib/dsh-server-login`、镜像名），刻意不改：**仓名做产品名，包名做组件名**。
 
 > **本仓是 [pointer-a/dsh-server-login](https://github.com/pointer-a/dsh-server-login) 的独立二开仓**
 > （导入基线 commit `04bc832`，MIT）。上游关系与「**产物不是真源**」的铁律见 [FORK.md](FORK.md)，
-> 版权与归属见 [NOTICE](NOTICE)。以下正文为上游原文。
+> 版权与归属见 [NOTICE](NOTICE)。**第 13 行起的正文为上游原文**。
 >
 > **本仓新增（上游没有）**：CubeSandbox 执行后端 —— 同时支持 **per-user 长期沙箱** 与
 > **per-task 一次性沙箱**；方案与上游接缝坐标见 [docs/plan/cubesandbox-backend.md](docs/plan/cubesandbox-backend.md)。
 
-[![build](https://github.com/pointer-a/dsh-server-login/actions/workflows/build.yml/badge.svg)](https://github.com/pointer-a/dsh-server-login/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> CI 徽章已移除：本仓 `.github/workflows/build.yml` 末段需要上游的私有 ACR 凭据
+> （`secrets.ACR_USERNAME` / `ACR_PASSWORD`），在本仓无法转绿，挂着只会常年显示失败。
 
 **面向公网的多租户 DSH 托管平台** —— 部署到一台公网服务器后，多个用户注册并经管理员审核，各自获得一套**相互隔离**的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）环境，随时通过域名安全访问（已适配手机端）。
 
@@ -62,8 +67,8 @@ nginx（TLS 终结，主域 + *.子域 通配）
 前置：Linux 服务器、Node **^22.19 或 ≥24**、已安装 DSH CLI（`npm i -g @deepseek-ai/dsh`）。完整的生产流程（systemd / DNS / 通配证书 / nginx）见[部署教程](docs/deployment.md)。
 
 ```sh
-git clone https://github.com/pointer-a/dsh-server-login.git
-cd dsh-server-login
+git clone https://github.com/gpmlimeng-cyber/dsh-ent-core.git
+cd dsh-ent-core
 npm install && npm run build            # tsc → lib/
 
 # 1) 创建首个管理员（用它登录管理台）

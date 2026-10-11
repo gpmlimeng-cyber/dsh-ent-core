@@ -90,8 +90,8 @@ dsh --version    # 能打印版本号就是装好了
 
 ```sh
 # 1) 下载源码
-git clone https://github.com/pointer-a/dsh-server-login.git
-cd dsh-server-login
+git clone https://github.com/gpmlimeng-cyber/dsh-ent-core.git
+cd dsh-ent-core
 
 # 2) 装依赖 + 编译
 npm install
